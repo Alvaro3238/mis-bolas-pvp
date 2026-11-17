@@ -7,9 +7,14 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 // Baneos y versión mínima (se cambian en Render → Environment, sin tocar el código):
-//   BANNED      = IDs de jugador separados por comas, p. ej. "MF-7K2P9QXA,MF-ABCD1234"
+//   BANNED      = IDs de jugador y/o apodos separados por comas, p. ej. "MF-7K2P9QXA,MF-ABCD1234,BumBum313"
+//                 (lo que empieza por MF- es un ID; lo demás, un apodo. Mayúsculas o minúsculas da igual)
 //   MIN_VERSION = versión mínima para jugar en línea, p. ej. "v267" (vacío = cualquiera)
-const BANNED = new Set(String(process.env.BANNED || '').toUpperCase().split(/[\s,;]+/).filter(Boolean));
+const BANNED = new Set(String(process.env.BANNED || '').toUpperCase().split(/[\s,;]+/).filter(Boolean));   // IDs y apodos, en mayúsculas
+const banSeen = new Set();   // IDs vistos con un apodo baneado: quedan baneados aunque cambie de apodo (hasta que se reinicie el servidor)
+const isBanned = (dev, name) => { dev = String(dev || '').toUpperCase(); name = String(name || '').trim().toUpperCase();
+  const b = (dev && (BANNED.has(dev) || banSeen.has(dev))) || (name && name !== 'JUGADOR' && BANNED.has(name));
+  if (b && dev) banSeen.add(dev); return !!b; };
 const verNum = v => { const m = /^v?(\d+)$/i.exec(String(v || '').trim()); return m ? Number(m[1]) : 0; };
 const MIN_VERSION = verNum(process.env.MIN_VERSION);
 const bannedNames = new Set();   // apodos usados por IDs baneados: no salen en la clasificación
@@ -30,9 +35,11 @@ const top3 = () => [...board.values()].sort((a, b) => b.trophies - a.trophies ||
 
 const server = http.createServer((req, res) => {
   if (req.url && req.url.startsWith('/ban')) {   // ¿este ID está baneado? (el juego lo pregunta al abrirse y al darle a jugar)
-    let id = ''; try { id = String(new URL(req.url, 'http://x').searchParams.get('id') || '').toUpperCase().slice(0, 20); } catch (e) {}
+    let id = '', n = '', v = ''; try { const q = new URL(req.url, 'http://x').searchParams; id = String(q.get('id') || '').toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 20); n = String(q.get('n') || '').slice(0, 24); v = String(q.get('v') || '').slice(0, 12); } catch (e) {}
+    const b = isBanned(id, n);
+    if (id) console.log(`abrir · id=${id} · apodo=${n || '?'} · versión=${v || '?'} · baneado=${b ? 'SÍ' : 'no'}`);
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({ banned: !!(id && BANNED.has(id)) })); return;
+    res.end(JSON.stringify({ banned: b })); return;
   }
   if (req.url && req.url.startsWith('/top')) {
     try { const q = new URL(req.url, 'http://x').searchParams; if (q.get('n')) record(cleanLoadout({ name: q.get('n'), trophies: q.get('t'), id: q.get('b') })); } catch (e) {}
@@ -111,7 +118,7 @@ function handle(ws, m) {
       ws.dev = dev; ws.loadout = cleanLoadout(m.loadout);
       console.log(`buscar · id=${dev || '?'} · apodo=${ws.loadout.name} · trofeos=${ws.loadout.trophies} · versión=${ver || '?'}`);
       if (MIN_VERSION && verNum(ver) < MIN_VERSION) { send(ws, { t: 'old' }); return; }
-      if (dev && BANNED.has(dev)) { bannedNames.add(ws.loadout.name.toLowerCase()); board.delete(ws.loadout.name.toLowerCase()); send(ws, { t: 'banned' }); return; }
+      if (isBanned(dev, ws.loadout.name)) { bannedNames.add(ws.loadout.name.toLowerCase()); board.delete(ws.loadout.name.toLowerCase()); send(ws, { t: 'banned' }); return; }
       ws.qT = Date.now(); record(ws.loadout);
       leaveQueue(ws); queue.push(ws);
       send(ws, { t: 'wait', online: clients.size, queue: queue.length });
@@ -138,7 +145,7 @@ function handle(ws, m) {
       { const w = ws === room.host ? 'B' : 'A'; closeRoom(room, { t: 'end', winner: w, reason: 'quit' }, { t: 'end', winner: w, reason: 'quit' }); }
       break;
     case 'report':         // el jugador manda sus trofeos tras un combate
-      if (ws.dev && BANNED.has(ws.dev)) return;
+      if (isBanned(ws.dev, ws.loadout && ws.loadout.name)) return;
       record(cleanLoadout(m.loadout));
       send(ws, { t: 'top', top: top3() });
       break;
