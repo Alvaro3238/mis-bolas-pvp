@@ -6,6 +6,13 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
+// Baneos y versión mínima (se cambian en Render → Environment, sin tocar el código):
+//   BANNED      = IDs de jugador separados por comas, p. ej. "MF-7K2P9QXA,MF-ABCD1234"
+//   MIN_VERSION = versión mínima para jugar en línea, p. ej. "v267" (vacío = cualquiera)
+const BANNED = new Set(String(process.env.BANNED || '').toUpperCase().split(/[\s,;]+/).filter(Boolean));
+const verNum = v => { const m = /^v?(\d+)$/i.exec(String(v || '').trim()); return m ? Number(m[1]) : 0; };
+const MIN_VERSION = verNum(process.env.MIN_VERSION);
+const bannedNames = new Set();   // apodos usados por IDs baneados: no salen en la clasificación
 const ARENAS = ['clasica', 'pilares', 'electrica', 'hielo', 'portales', 'pinball'];
 const MAX_MATCH_MS = 4 * 60 * 1000;      // una sala no dura más de 4 minutos
 const clients = new Set();
@@ -14,7 +21,7 @@ let nextId = 1, nextRoom = 1, matchesPlayed = 0;
 // Clasificación: última puntuación conocida de cada apodo (en memoria: se borra si el servidor se reinicia)
 const board = new Map();
 function record(l) {
-  if (!l || !l.name || l.name === 'Jugador') return;
+  if (!l || !l.name || l.name === 'Jugador' || bannedNames.has(l.name.toLowerCase())) return;
   const key = l.name.toLowerCase(), old = board.get(key);  // se guarda la puntuación más reciente de cada apodo
   board.set(key, { name: l.name, trophies: l.trophies, ball: l.id, at: old && old.trophies === l.trophies ? old.at : Date.now() });
   if (board.size > 5000) { const worst = [...board.entries()].sort((a, b) => a[1].trophies - b[1].trophies)[0]; board.delete(worst[0]); }
@@ -28,7 +35,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ top: top3(), players: board.size })); return;
   }
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' });
-  res.end(`Mis Bolas PVP funcionando · conectados: ${clients.size} · buscando: ${queue.length} · combates: ${matchesPlayed}\n`);
+  res.end(`Mis Bolas PVP funcionando · conectados: ${clients.size} · buscando: ${queue.length} · combates: ${matchesPlayed} · baneados: ${BANNED.size} · versión mínima: ${MIN_VERSION ? 'v' + MIN_VERSION : 'ninguna'}\n`);
 });
 const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
 
@@ -93,13 +100,18 @@ function handle(ws, m) {
   if (!m || typeof m.t !== 'string') return;
   const room = ws.room;
   switch (m.t) {
-    case 'find':
+    case 'find': {
       if (room) return;
-      ws.loadout = cleanLoadout(m.loadout); ws.qT = Date.now(); record(ws.loadout);
+      const dev = str(m.dev, 16).toUpperCase().replace(/[^A-Z0-9-]/g, ''), ver = str(m.v, 12);
+      ws.dev = dev; ws.loadout = cleanLoadout(m.loadout);
+      console.log(`buscar · id=${dev || '?'} · apodo=${ws.loadout.name} · trofeos=${ws.loadout.trophies} · versión=${ver || '?'}`);
+      if (MIN_VERSION && verNum(ver) < MIN_VERSION) { send(ws, { t: 'old' }); return; }
+      if (dev && BANNED.has(dev)) { bannedNames.add(ws.loadout.name.toLowerCase()); board.delete(ws.loadout.name.toLowerCase()); send(ws, { t: 'banned' }); return; }
+      ws.qT = Date.now(); record(ws.loadout);
       leaveQueue(ws); queue.push(ws);
       send(ws, { t: 'wait', online: clients.size, queue: queue.length });
       tryMatch();
-      break;
+      break; }
     case 'cancel':
       leaveQueue(ws);
       break;
@@ -121,6 +133,7 @@ function handle(ws, m) {
       { const w = ws === room.host ? 'B' : 'A'; closeRoom(room, { t: 'end', winner: w, reason: 'quit' }, { t: 'end', winner: w, reason: 'quit' }); }
       break;
     case 'report':         // el jugador manda sus trofeos tras un combate
+      if (ws.dev && BANNED.has(ws.dev)) return;
       record(cleanLoadout(m.loadout));
       send(ws, { t: 'top', top: top3() });
       break;
