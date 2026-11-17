@@ -29,6 +29,11 @@ function record(l) {
 const top3 = () => [...board.values()].sort((a, b) => b.trophies - a.trophies || a.at - b.at).slice(0, 3).map(({ name, trophies, ball }) => ({ name, trophies, ball }));
 
 const server = http.createServer((req, res) => {
+  if (req.url && req.url.startsWith('/ban')) {   // ¿este ID está baneado? (el juego lo pregunta al abrirse y al darle a jugar)
+    let id = ''; try { id = String(new URL(req.url, 'http://x').searchParams.get('id') || '').toUpperCase().slice(0, 20); } catch (e) {}
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ banned: !!(id && BANNED.has(id)) })); return;
+  }
   if (req.url && req.url.startsWith('/top')) {
     try { const q = new URL(req.url, 'http://x').searchParams; if (q.get('n')) record(cleanLoadout({ name: q.get('n'), trophies: q.get('t'), id: q.get('b') })); } catch (e) {}
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
