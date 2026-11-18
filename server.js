@@ -98,6 +98,19 @@ async function dbInit() {
   await q(`create index if not exists sessions_acct on sessions (acct)`);
   await q(`create table if not exists names (name_lc text primary key, name text not null, owner text not null, updated timestamptz not null default now())`);
   await q(`create index if not exists names_owner on names (owner)`);
+  await q(`create table if not exists players (
+    id text primary key references accounts(id) on delete cascade, code text unique not null,
+    name text not null default 'Jugador', trophies integer not null default 0, ball text not null default 'filo', seen timestamptz not null default now())`);
+  await q(`create table if not exists friends (
+    a text not null references players(id) on delete cascade, b text not null references players(id) on delete cascade,
+    ok boolean not null default false, created timestamptz not null default now(), primary key (a, b))`);
+  await q(`create index if not exists friends_b on friends (b)`);
+  await q(`create table if not exists blocks (
+    a text not null references players(id) on delete cascade, b text not null references players(id) on delete cascade,
+    created timestamptz not null default now(), primary key (a, b))`);
+  await q(`create table if not exists reports (
+    id bigserial primary key, by_who text not null, target text not null, target_name text not null default '',
+    why text not null default '', created timestamptz not null default now())`);
   await q(`create table if not exists bans (target text primary key, reason text not null default '', until bigint not null default 0, by_who text not null default '', created timestamptz not null default now())`);
   for (const r of await q('select target, reason, until, by_who from bans')) bans.set(r.target, { until: Number(r.until) || 0, reason: r.reason, by: r.by_who, at: 0 });
   for (const r of await q('select name_lc, owner from names')) nameOwner.set(r.name_lc, r.owner);
@@ -208,7 +221,7 @@ const top3 = () => [...board.values()].sort((a, b) => b.trophies - a.trophies ||
 
 /* ================= Página de baneos: https://…onrender.com/admin (contraseña ADMIN_KEY) ================= */
 const escH = v => String(v == null ? '' : v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-function adminPage(key, msg) {
+function adminPage(key, msg, reps) {
   const now = Date.now(), list = [...bans.entries()].filter(([, b]) => banLive(b)).sort((a, b) => (b[1].at || 0) - (a[1].at || 0));
   const left = b => { if (!b.until) return 'Indefinido'; const s = Math.max(0, (b.until - now) / 1000 | 0), d = s / 86400 | 0, h = (s % 86400) / 3600 | 0, m = (s % 3600) / 60 | 0; return (d ? d + ' d ' : '') + h + ' h ' + m + ' min'; };
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Baneos · Marble Fights</title>
@@ -225,6 +238,7 @@ button{height:44px;border:0;border-radius:10px;padding:0 16px;font-weight:700;fo
 <label>Motivo (lo verá el jugador)</label><input name="reason" maxlength="120" placeholder="Insultos, trampas…"><button>Banear</button>
 <p class="hint">Los IDs y apodos salen en Render → Logs (líneas «abrir» y «buscar»).</p></form>
 <div class="c"><b>Baneados ahora (${list.length})</b>${list.map(([t, b]) => `<div class="row"><div><b>${escH(t)}</b><small>${escH(b.reason || 'Sin motivo')} · ${left(b)}${b.by && b.by !== 'admin' ? ' · ' + escH(b.by) : ''}</small></div>${b.by === 'BANNED' ? '<small>en BANNED</small>' : `<form method="post" action="/admin"><input type="hidden" name="key" value="${escH(key)}"><input type="hidden" name="a" value="unban"><input type="hidden" name="target" value="${escH(t)}"><button>Quitar</button></form>`}</div>`).join('') || '<p class="hint">Nadie.</p>'}</div>
+<div class="c"><b>Denuncias de amigos (últimas ${(reps || []).length})</b>${(reps || []).map(x => `<div class="row"><div><b>${escH(x.tuser || x.target_name)}</b><small>apodo: ${escH(x.target_name)} · motivo: ${escH(x.why || '—')} · denunciado por ${escH(x.buser || '?')} · ${escH(new Date(Number(x.ts)).toLocaleString('es-ES', { timeZone: 'Europe/Madrid', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }))}</small></div></div>`).join('') || '<p class="hint">Ninguna.</p>'}<p class="hint">Para banear a alguien denunciado, escribe arriba su usuario (la primera línea en negrita).</p></div>
 <p class="hint">${dbReady ? 'Los baneos se guardan en la base de datos.' : 'Sin base de datos: los baneos de esta página se pierden si el servidor se reinicia.'}</p></body></html>`; }
 function adminHttp(req, res) {
   const html = (code, h) => { res.writeHead(code, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-robots-tag': 'noindex' }); res.end(h); };
@@ -241,7 +255,9 @@ function adminHttp(req, res) {
     const a = f.get('a'); let msg = '';
     if (a === 'ban') { const t = f.get('target'), h = Number(f.get('hours')) || 0; const b = await banAdd(t, h, f.get('reason'), 'admin'); msg = b ? `Baneado: ${String(t).trim().toUpperCase()}` : 'Falta a quién banear.'; }
     if (a === 'unban') { await banDel(f.get('target')); msg = `Quitado: ${f.get('target')}`; }
-    html(200, adminPage(key, msg)); }); }
+    let reps = []; if (dbReady) { try { reps = await q(`select r.target_name, r.why, (extract(epoch from r.created) * 1000)::bigint as ts, ta.username as tuser, ba.username as buser
+      from reports r left join accounts ta on ta.id = r.target left join accounts ba on ba.id = r.by_who order by r.created desc limit 20`); } catch (e) {} }
+    html(200, adminPage(key, msg, reps)); }); }
 
 const server = http.createServer((req, res) => {
   if (req.url === '/ping' || req.url.startsWith('/ping?')) { res.writeHead(200, { 'content-type': 'text/plain', 'cache-control': 'no-store', 'access-control-allow-origin': '*' }); res.end('ok'); return; }   // para mantenerlo despierto (no toca la base de datos)
@@ -260,7 +276,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ top: top3(), players: board.size })); return;
   }
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' });
-  res.end(`Mis Bolas PVP funcionando · conectados: ${clients.size} · buscando: ${queue.length} · combates: ${matchesPlayed} · baneados: ${[...bans.values()].filter(banLive).length} · versión mínima: ${MIN_VERSION ? 'v' + MIN_VERSION : 'ninguna'} · cuentas: ${dbReady ? 'sí' : pool ? 'base de datos sin conectar' : 'no (falta DATABASE_URL)'}\n`);
+  res.end(`Mis Bolas PVP funcionando · conectados: ${clients.size} · buscando: ${queue.length} · combates: ${matchesPlayed} · baneados: ${[...bans.values()].filter(banLive).length} · versión mínima: ${MIN_VERSION ? 'v' + MIN_VERSION : 'ninguna'} · cuentas y amigos: ${dbReady ? 'sí' : pool ? 'base de datos sin conectar' : 'no (falta DATABASE_URL)'}\n`);
 });
 const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
 
@@ -321,7 +337,98 @@ function closeRoom(room, msgHost, msgGuest) {
   if (msgGuest) send(room.guest, msgGuest);
 }
 
+/* ================= Amigos (con la cuenta de la nube) =================
+   Cada cuenta tiene un jugador con código de amigo MF-XXXXXX. La conexión se identifica con el token de sesión. */
+const MAX_FRIENDS = 100;
+const CODE_ABC = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const newCode = () => 'MF-' + Array.from(crypto.randomBytes(6), b => CODE_ABC[b % 32]).join('');
+const normCode = v => { v = String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, ''); if (v.startsWith('MF')) v = v.slice(2); return v.length === 6 ? 'MF-' + v : null; };
+const online = new Map();                 // id de cuenta → conexiones abiertas
+const isOnline = id => { const s = online.get(id); return !!(s && s.size); };
+const tell = (id, o) => { const s = online.get(id); if (s) for (const w of s) send(w, o); };
+async function socAuth(ws, m) {
+  if (!dbReady) return send(ws, { t: 'auth', err: 'nodb' });
+  const prof = cleanLoadout(m.loadout);
+  if (!ws.pid) {
+    const A = await bySession(str(m.token, 80)); if (!A) return send(ws, { t: 'auth', err: 'auth' });
+    if (banInfo(ws.dev, '', A.username)) return send(ws, { t: 'auth', err: 'banned' });
+    let r = await q('select code from players where id = $1', [A.id]);
+    if (!r.length) { for (let i = 0; i < 6 && !r.length; i++) r = await q('insert into players (id, code) values ($1, $2) on conflict do nothing returning code', [A.id, newCode()]); }
+    if (!r.length) return send(ws, { t: 'auth', err: 'db' });
+    ws.pid = A.id; ws.code = r[0].code; ws.user = A.username;
+    if (!online.has(A.id)) online.set(A.id, new Set());
+    const first = !online.get(A.id).size; online.get(A.id).add(ws);
+    if (first) friendsTell(A.id);   // tus amigos te ven conectado
+  }
+  await saveProfile(ws, prof);
+  send(ws, { t: 'auth', code: ws.code });
+  await sendFriends(ws);
+}
+async function saveProfile(ws, l) {
+  if (!dbReady || !ws.pid || !l) return;
+  const name = l.name !== 'Jugador' && !mfBadName(l.name) ? l.name : 'Jugador';
+  await q('update players set name = $2, trophies = $3, ball = $4, seen = now() where id = $1', [ws.pid, name, l.trophies, l.id]);
+}
+async function friendsTell(id) { try { const rows = await q('select case when a = $1 then b else a end as o from friends where (a = $1 or b = $1) and ok', [id]); for (const r of rows) tell(r.o, { t: 'fr_ev' }); } catch (e) {} }
+async function sendFriends(ws, extra) {
+  const rows = await q(`select p.id, p.code, p.name, p.trophies, p.ball, f.ok, (f.a = $1) as mine
+    from friends f join players p on p.id = case when f.a = $1 then f.b else f.a end
+    where f.a = $1 or f.b = $1 order by f.ok desc, p.trophies desc, p.name limit 250`, [ws.pid]);
+  send(ws, { t: 'fr', ...(extra || {}), list: rows.map(r => ({ code: r.code, name: r.name, trophies: r.trophies, ball: r.ball,
+    st: r.ok ? 'ok' : r.mine ? 'out' : 'in', on: r.ok ? isOnline(r.id) : false })) });
+}
+async function target(ws, m) {
+  const code = normCode(m.code); if (!code) return null;
+  const r = await q('select id, name from players where code = $1', [code]);
+  return r.length && r[0].id !== ws.pid ? r[0] : (r.length ? { self: true } : null);
+}
+async function social(ws, m) {
+  if (m.t === 'auth') return socAuth(ws, m);
+  if (!dbReady) return send(ws, { t: 'fr', err: 'nodb', list: [] });
+  if (!ws.pid) return send(ws, { t: 'fr', err: 'noauth', list: [] });
+  const me = ws.pid;
+  if (m.t === 'fr_list') return sendFriends(ws);
+  const tg = await target(ws, m);
+  if (!tg) return sendFriends(ws, { op: m.t, err: 'nf' });
+  if (tg.self) return sendFriends(ws, { op: m.t, err: 'self' });
+  if (m.t === 'fr_add') {
+    const blk = await q('select 1 from blocks where (a = $1 and b = $2) or (a = $2 and b = $1)', [me, tg.id]);
+    if (blk.length) return sendFriends(ws, { op: m.t, err: 'nf' });
+    const ex = await q('select a, ok from friends where (a = $1 and b = $2) or (a = $2 and b = $1)', [me, tg.id]);
+    if (ex.length && (ex[0].ok || ex[0].a === me)) return sendFriends(ws, { op: m.t, err: 'dup' });
+    const n = await q('select (select count(*) from friends where a = $1 or b = $1)::int as mine, (select count(*) from friends where a = $2 or b = $2)::int as theirs', [me, tg.id]);
+    if (n[0].mine >= MAX_FRIENDS) return sendFriends(ws, { op: m.t, err: 'full' });
+    if (n[0].theirs >= MAX_FRIENDS) return sendFriends(ws, { op: m.t, err: 'full2' });
+    if (ex.length) await q('update friends set ok = true where a = $2 and b = $1', [me, tg.id]);
+    else await q('insert into friends (a, b) values ($1, $2) on conflict do nothing', [me, tg.id]);
+    tell(tg.id, { t: 'fr_ev' });
+    return sendFriends(ws, { op: m.t, ok: ex.length ? 'friends' : 'sent', name: tg.name });
+  }
+  if (m.t === 'fr_ok') {
+    const r = await q('update friends set ok = true where a = $2 and b = $1 and not ok returning a', [me, tg.id]);
+    if (r.length) tell(tg.id, { t: 'fr_ev' });
+    return sendFriends(ws, { op: m.t, ok: r.length ? 'friends' : undefined, name: tg.name });
+  }
+  if (m.t === 'fr_del' || m.t === 'fr_rep') {
+    if (m.t === 'fr_rep') {
+      await q('insert into reports (by_who, target, target_name, why) values ($1, $2, $3, $4)', [me, tg.id, tg.name, str(m.why, 200)]);
+      await q('insert into blocks (a, b) values ($1, $2) on conflict do nothing', [me, tg.id]);
+      console.log(`DENUNCIA · ${ws.user} denuncia a «${tg.name}» · motivo: ${str(m.why, 60)}`);
+    }
+    await q('delete from friends where (a = $1 and b = $2) or (a = $2 and b = $1)', [me, tg.id]);
+    tell(tg.id, { t: 'fr_ev' });
+    return sendFriends(ws, { op: m.t, ok: m.t === 'fr_rep' ? 'reported' : 'removed', name: tg.name });
+  }
+}
+function socialMsg(ws, m) {               // en fila y con freno
+  const now = Date.now(); ws.socT = (ws.socT || []).filter(t => now - t < 20000);
+  if (ws.socT.length >= 30) return send(ws, { t: 'fr', err: 'slow', list: null });
+  ws.socT.push(now);
+  ws.chain = (ws.chain || Promise.resolve()).then(() => social(ws, m)).catch(e => { console.error('amigos', e.message); send(ws, { t: m.t === 'auth' ? 'auth' : 'fr', err: 'db', list: null }); });
+}
+
 function handle(ws, m) {
+  if (m && ['auth', 'fr_list', 'fr_add', 'fr_ok', 'fr_del', 'fr_rep'].includes(m.t)) { if (!ws.dev && m.dev) ws.dev = str(m.dev, 20).toUpperCase().replace(/[^A-Z0-9-]/g, ''); return socialMsg(ws, m); }
   if (!m || typeof m.t !== 'string') return;
   const room = ws.room;
   switch (m.t) {
@@ -361,7 +468,7 @@ function handle(ws, m) {
       break;
     case 'report':         // el jugador manda sus trofeos tras un combate
       if (isBanned(ws.dev, ws.loadout && ws.loadout.name)) return;
-      record(cleanLoadout(m.loadout));
+      { const l = cleanLoadout(m.loadout); record(l); saveProfile(ws, l).catch(() => {}); }
       send(ws, { t: 'top', top: top3() });
       break;
     case 'top':
@@ -380,6 +487,7 @@ wss.on('connection', ws => {
   ws.on('message', raw => { let m; try { m = JSON.parse(raw); } catch (e) { return; } try { handle(ws, m); } catch (e) { console.error(e); } });
   ws.on('close', () => {
     clients.delete(ws); leaveQueue(ws);
+    if (ws.pid) { const s = online.get(ws.pid); if (s) { s.delete(ws); if (!s.size) { online.delete(ws.pid); friendsTell(ws.pid); } } }
     const room = ws.room;
     if (room && !room.closed) { const other = ws === room.host ? room.guest : room.host; closeRoom(room, null, null); send(other, { t: 'left' }); }
   });
