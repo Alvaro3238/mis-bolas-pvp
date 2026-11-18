@@ -1,7 +1,7 @@
 {
   "name": "mis-bolas-pvp",
-  "version": "1.0.0",
-  "description": "Servidor PVP en línea de Mis Bolas",
+  "version": "1.2.0",
+  "description": "Servidor en línea de Marble Fights (PVP y cuentas con guardado en la nube)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,6 +10,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "pg": "^8.11.0",
     "ws": "^8.18.0"
   }
 }
