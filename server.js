@@ -20,6 +20,10 @@ const BANNED = new Set(String(process.env.BANNED || '').toUpperCase().split(/[\s
 /* Baneos con motivo y duración: objetivo (ID MF-…, apodo o usuario, en mayúsculas) → { until: ms (0 = indefinido), reason, by, at } */
 const bans = new Map();
 const giftPend = new Set();
+const SET = {};   // ajustes del panel guardados en la tabla settings: maint {on, msg}, notice {id, title, text, until}
+async function setSet(k, v) { SET[k] = v; if (dbReady) await q(`insert into settings (k, v) values ($1, $2) on conflict (k) do update set v = $2`, [k, JSON.stringify(v)]); }
+const maintOn = () => !!(SET.maint && SET.maint.on);
+const noticeNow = () => { const n = SET.notice; return n && n.text && (!n.until || n.until > Date.now()) ? n : null; };
 let gAll = [];   // regalos para todos activos: { id, until, claimed: Set('D:'+ID / 'A:'+cuenta) }   // 'D:'+ID o 'A:'+cuenta con regalos sin recoger
 for (const t of BANNED) bans.set(t, { until: 0, reason: '', by: 'BANNED', at: 0 });
 const banSeen = new Map();   // ID → baneo, para los IDs vistos con un apodo o cuenta baneados (siguen baneados aunque cambien de apodo)
@@ -137,6 +141,13 @@ async function dbInit() {
   await q(`create table if not exists gift_all_claims (gift bigint not null, who text not null, at timestamptz not null default now(), primary key (gift, who))`);
   await gAllLoad();
   for (const r of await q('select target_acct, target_dev from gifts where claimed_at is null')) { if (r.target_acct) giftPend.add('A:' + r.target_acct); if (r.target_dev) giftPend.add('D:' + r.target_dev); }
+  await q(`create table if not exists settings (k text primary key, v text not null default '')`);
+  for (const x of await q('select k, v from settings')) { try { SET[x.k] = JSON.parse(x.v); } catch (e) {} }
+  await q(`create table if not exists matches (id bigserial primary key, created timestamptz not null default now(), kind text not null default 'comp', winner text, reason text not null default '', dur integer not null default 0,
+    a_name text, a_dev text, a_user text, a_tr integer, a_card text, b_name text, b_dev text, b_user text, b_tr integer, b_card text)`);
+  await q(`create index if not exists matches_created on matches (created desc)`);
+  await q(`create table if not exists promos (code text primary key, coins integer not null default 0, gems integer not null default 0, max_uses integer not null default 0, uses integer not null default 0, until timestamptz, msg text not null default '', active boolean not null default true, created timestamptz not null default now())`);
+  await q(`create table if not exists promo_uses (code text not null, who text not null, at timestamptz not null default now(), primary key (code, who))`);
   await q(`create table if not exists seen (dev text primary key, name text not null default '', acct text not null default '', acct_lc text not null default '', ver text not null default '',
     first_at timestamptz not null default now(), last_at timestamptz not null default now(), opens integer not null default 1)`);
   await q(`create table if not exists bans (target text primary key, reason text not null default '', until bigint not null default 0, by_who text not null default '', created timestamptz not null default now())`);
@@ -252,6 +263,23 @@ async function acctAction(a, body, ip) {
     catch (e) { if (/unique|duplicate/i.test(e.message)) return { err: /google/i.test(e.message) ? 'gtaken' : 'taken' }; throw e; }
     console.log(`cuenta nueva con Google · ${user} · id=${dev || '?'}`);
     return { ok: true, created: true, user, token: await newSession(id, dev), at: save ? at : 0, g: G.email || '' };
+  }
+  if (a === 'promo') {   // v298 · canjear un código promocional (una vez por cuenta y por móvil)
+    if (!dev) return { err: 'promo_bad' };
+    if (hit('promo:' + ip, 12, 60e3) || hit('promo:' + dev, 8, 60e3)) return { err: 'slow' };
+    const code = String(body.code || '').toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24); if (!code) return { err: 'promo_bad' };
+    const A = body.token ? await bySession(body.token) : null;
+    if (banInfo(dev, '', A ? A.username : '')) return { err: 'banned' };
+    const P = (await q(`select code, coins, gems, msg, max_uses, uses, active, (until is not null and until < now()) as late from promos where code = $1`, [code]))[0];
+    if (!P || !P.active) return { err: 'promo_bad' };
+    if (P.late) return { err: 'promo_late' };
+    if (P.max_uses > 0 && P.uses >= P.max_uses) return { err: 'promo_full' };
+    const whos = ['D:' + dev, ...(A ? ['A:' + A.id] : [])];
+    const used = await q(`select 1 from promo_uses where code = $1 and (who = $2 or who = $3)`, [code, whos[0], whos[1] || whos[0]]); if (used.length) return { err: 'promo_used' };
+    const up = await q(`update promos set uses = uses + 1 where code = $1 and (max_uses = 0 or uses < max_uses) returning uses`, [code]); if (!up.length) return { err: 'promo_full' };
+    for (const w of whos) await q(`insert into promo_uses (code, who) values ($1, $2) on conflict do nothing`, [code, w]);
+    console.log(`CÓDIGO canjeado · ${code} · ${A ? A.username : dev}`);
+    return { ok: true, coins: Number(P.coins) || 0, gems: Number(P.gems) || 0, msg: P.msg || '' };
   }
   if (a === 'gift') {   // regalos del panel: por ID de dispositivo o por cuenta (con sesión)
     const A = body.token ? await bySession(body.token) : null; if (!dev) return { ok: true, gifts: [] };
@@ -392,7 +420,7 @@ async function playerInfo(dev, usr) {
   return { dev, acc, devs, friends, club, repIn, repOut, gifts, names, keys, blog, live, seenBan };
 }
 /* ================= Panel de admin: https://…onrender.com/admin (contraseña ADMIN_KEY) =================
-   Apartados: Inicio · Jugadores (y ficha) · Baneos · Regalos · Denuncias.
+   Apartados: Inicio · Jugadores (y ficha) · Baneos · Regalos · Denuncias · Más (Juego, Códigos, Clubs, Combates).
    Se entra una vez con la contraseña y queda una cookie de sesión (12 h); al reiniciar el servidor hay que volver a entrar. */
 const escH = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const admSess = new Map();
@@ -413,6 +441,13 @@ const IC = {
   back: '<path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
   chev: '<path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>',
   dot: '<circle cx="12" cy="12" r="5" fill="currentColor"/>',
+  more: '<circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/>',
+  megaphone: '<path d="M3 10v4h3l7 4V6L6 10zM16.5 8.5a5 5 0 0 1 0 7M6 14l1.5 5h3L9 15" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>',
+  wrench: '<path d="M14.7 6.3a4 4 0 0 0 5 5L21 13l-8 8-3-3 1.3-1.3M14.7 6.3 13 4.6a4 4 0 0 0-5 5L3 14.6 9.4 21l5-5a4 4 0 0 0 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>',
+  ticket: '<path d="M3 8a2 2 0 0 0 0 4v0a2 2 0 0 0 0 4v2h18v-2a2 2 0 0 1 0-4 2 2 0 0 1 0-4V6H3zM14 6v12" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-dasharray="0"/>',
+  shield: '<path d="M12 3 4 6v6c0 4.5 3.4 8.3 8 9 4.6-.7 8-4.5 8-9V6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>',
+  swords: '<path d="M14.5 3H21v6.5L9 21.5 2.5 15zM9.5 3H3v6.5L15 21.5l6.5-6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
+  chat: '<path d="M4 5h16v11H9l-5 4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>',
 };
 const ic = (n, cls) => `<svg class="ic${cls ? ' ' + cls : ''}" viewBox="0 0 24 24" aria-hidden="true">${IC[n]}</svg>`;
 const ADM_CSS = `:root{--bg:#120c10;--card:#211820;--in:#171015;--line:#35262f;--gold:#ffd54a;--txt:#f5ecf1;--mut:#b4a3ad;--red:#ff8f99;--grn:#8ee6a8;--blue:#9fd0ff;color-scheme:dark}
@@ -424,8 +459,8 @@ header h1{flex:1;margin:0;font-size:19px;letter-spacing:.2px;white-space:nowrap;
 .hb{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;color:var(--mut);background:transparent;border:0;text-decoration:none}
 .hb:active{background:#2a1f27}
 main{max-width:760px;margin:0 auto;padding:14px 14px calc(92px + env(safe-area-inset-bottom))}
-nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:6;display:grid;grid-template-columns:repeat(5,1fr);background:rgba(24,17,21,.95);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
-nav.tabs a{display:grid;justify-items:center;gap:3px;padding:9px 0 8px;color:var(--mut);text-decoration:none;font-size:11.5px;font-weight:650;position:relative}
+nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:6;display:grid;grid-template-columns:repeat(6,1fr);background:rgba(24,17,21,.95);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+nav.tabs a{display:grid;justify-items:center;gap:3px;padding:9px 0 8px;color:var(--mut);text-decoration:none;font-size:11px;font-weight:650;position:relative;white-space:nowrap}
 nav.tabs a .ic{width:24px;height:24px}
 nav.tabs a.on{color:var(--gold)}
 nav.tabs a.on::before{content:"";position:absolute;top:0;left:30%;right:30%;height:3px;border-radius:0 0 3px 3px;background:var(--gold)}
@@ -466,10 +501,12 @@ input:focus,select:focus{border-color:#a8873a;box-shadow:0 0 0 3px rgba(255,213,
 .state{display:flex;align-items:center;gap:10px;margin-top:12px;padding:11px 12px;border-radius:13px;background:rgba(142,230,168,.08);color:#c9f5d6;font-weight:650}.state.r{background:rgba(255,143,153,.1);color:#ffd0d5}.state .tx small{color:#e9b9bf}.state form{margin:0}
 .seg{display:flex;gap:6px;overflow-x:auto;margin:0 -2px 12px;padding:0 2px 2px;scrollbar-width:none}.seg::-webkit-scrollbar{display:none}
 .seg a{flex:none;padding:8px 14px;border-radius:20px;background:var(--card);color:var(--mut);text-decoration:none;font-size:14px;font-weight:650;border:1px solid var(--line)}.seg a.on{background:#3a2c12;color:var(--gold);border-color:rgba(255,213,74,.4)}
+textarea{width:100%;border-radius:12px;border:1.5px solid var(--line);background:var(--in);color:#fff;padding:11px 13px;font:inherit;font-size:16px;outline:none;resize:vertical;-webkit-appearance:none}textarea:focus{border-color:#a8873a;box-shadow:0 0 0 3px rgba(255,213,74,.15)}
+.mrow{padding:11px 0;border-top:1px solid var(--line)}.list>.mrow:first-child{border-top:0}.mhead{display:flex;align-items:center;gap:8px;margin-bottom:7px}.mhead small{color:var(--mut);font-size:12.5px}.mvs{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center}.vs{color:var(--mut);font-weight:900;font-size:12px}.mside{display:block;min-width:0;background:var(--in);border-radius:12px;padding:8px 10px;color:inherit;text-decoration:none}.mside.w{box-shadow:inset 0 0 0 1.5px rgba(255,213,74,.55)}.mside b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14.5px}.mside small{display:block;color:var(--mut);font-size:12px;overflow-wrap:anywhere}
 .login{min-height:100vh;display:grid;place-items:center;padding:24px}.login form{width:100%;max-width:360px;text-align:center}.login .logo{width:64px;height:64px;font-size:30px;border-radius:18px;margin:0 auto 14px}.login h1{margin:0 0 4px;font-size:24px}.login p{color:var(--mut);margin:0 0 18px}.login .err{color:var(--red);font-weight:600}`;
 function admShell(tab, title, body, opt) {
   opt = opt || {};
-  const T = [['home', 'Inicio', 'home'], ['players', 'Jugadores', 'users'], ['bans', 'Baneos', 'ban'], ['gifts', 'Regalos', 'gift'], ['reports', 'Denuncias', 'flag']];
+  const T = [['home', 'Inicio', 'home'], ['players', 'Jugadores', 'users'], ['bans', 'Baneos', 'ban'], ['gifts', 'Regalos', 'gift'], ['reports', 'Denuncias', 'flag'], ['more', 'Más', 'more']];
   const nav = T.map(([t, l, i]) => `<a href="${admUrl(t)}" class="${tab === t ? 'on' : ''}">${ic(i)}<span>${l}</span>${opt.badges && opt.badges[t] ? `<span class="bd">${opt.badges[t]}</span>` : ''}</a>`).join('');
   const flash = opt.m ? `<div class="flash${opt.err ? ' err' : ''}" role="status">${escH(opt.m)}</div>` : '';
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#120c10"><meta name="robots" content="noindex"><title>${escH(title)} · Panel Marble Fights</title><style>${ADM_CSS}</style></head><body>
@@ -541,7 +578,7 @@ ${P.live.length ? P.live.map(([k, b]) => `<div class="state r">${ic('ban')}<span
 <p class="hint" style="margin-top:0">${A && A.trophies != null ? `Ahora tiene <b style="color:#fff">${fmtN(A.trophies)}</b> trofeos (el último dato que mandó su juego).` : 'Sin cuenta no vemos sus trofeos.'}</p>
 <label>Sumar o quitar (pon − delante para quitar)</label><input name="trophies" type="number" min="-100000" max="100000" inputmode="numeric" placeholder="-200 o 150">
 <label>Mensaje (lo verá al abrir el juego)</label><input name="msg" maxlength="100" placeholder="Trofeos ganados con trampas"><button class="btn gold">${ic('trophy')}Corregir trofeos</button><p class="hint">Le sale un aviso como el del regalo. Nunca bajan de 0. ${who}</p></form>${admGiftList(P.gifts)}`;
-  if (sub === 'info') body = `<div class="card"><h2>${ic('users')}Móviles<small>${P.devs.length}</small></h2><div class="list">${P.devs.map(d => `<div class="it"><span class="av g">${ic('dot')}</span><span class="tx"><b>${escH(d.dev)}</b><small>${d.name ? 'apodo ' + escH(d.name) + ' · ' : ''}${d.ver ? escH(d.ver) + ' · ' : ''}${d.last_ms ? 'última vez ' + agoES(d.last_ms) + ' · abierto ' + d.opens + (d.opens == 1 ? ' vez' : ' veces') : 'sin datos de apertura'}</small></span></div>`).join('') || '<p class="none">Ninguno.</p>'}</div></div>
+  if (sub === 'info') body = `<a class="card it" style="padding:14px 16px" href="${admUrl('matches', { q: A ? A.username : P.dev })}"><span class="av b">${ic('swords')}</span><span class="tx"><b>Sus combates en línea</b><small>últimos 30 días</small></span>${ic('chev')}</a><div class="card"><h2>${ic('users')}Móviles<small>${P.devs.length}</small></h2><div class="list">${P.devs.map(d => `<div class="it"><span class="av g">${ic('dot')}</span><span class="tx"><b>${escH(d.dev)}</b><small>${d.name ? 'apodo ' + escH(d.name) + ' · ' : ''}${d.ver ? escH(d.ver) + ' · ' : ''}${d.last_ms ? 'última vez ' + agoES(d.last_ms) + ' · abierto ' + d.opens + (d.opens == 1 ? ' vez' : ' veces') : 'sin datos de apertura'}</small></span></div>`).join('') || '<p class="none">Ninguno.</p>'}</div></div>
 ${A ? `<div class="card"><h2>${ic('users')}Club</h2>${P.club ? `<div class="it"><span class="av b">${ini(P.club.name)}</span><span class="tx"><b>${escH(P.club.name)}</b><small>${P.club.role === 'owner' ? 'líder' : 'miembro'} · ${P.club.n} ${P.club.n == 1 ? 'miembro' : 'miembros'}</small></span></div>` : '<p class="none">No está en ningún club.</p>'}</div>
 <div class="card"><h2>${ic('users')}Amigos<small>${P.friends.filter(f => f.ok).length}</small></h2><div class="list">${P.friends.map(f => `<a class="it" href="${admUrl('players', { q: f.code })}"><span class="av g">${ini(f.name)}</span><span class="tx"><b>${escH(f.name)}${f.ok ? '' : '<span class="chip y">pendiente</span>'}</b><small>${escH(f.code)} · ${fmtN(f.trophies)} trofeos</small></span>${ic('chev')}</a>`).join('') || '<p class="none">Ninguno.</p>'}</div></div>
 <div class="card"><h2>${ic('flag')}Denuncias recibidas<small>${P.repIn.length}</small></h2><div class="list">${P.repIn.map(x => `<div class="it"><span class="av r">${ic('flag')}</span><span class="tx"><b>${escH(x.why || '—')}</b><small>se llamaba ${escH(x.target_name)} · denunciado por ${escH(x.other || '?')} · ${whenES(x.ts)}</small></span></div>`).join('') || '<p class="none">Ninguna.</p>'}</div></div>
@@ -595,6 +632,75 @@ async function admReports() {
 <p class="hint">Toca una para abrir la ficha del denunciado y banearlo desde allí. Quien denuncia también lo bloquea.</p></div>`;
 }
 
+/* ---------- Más (v298): Juego (aviso y mantenimiento) · Códigos · Clubs · Combates ---------- */
+const MAS = [['game', 'Juego', 'Aviso al abrir y mantenimiento', 'megaphone'], ['promos', 'Códigos', 'Códigos promocionales', 'ticket'], ['clubs', 'Clubs', 'Renombrar, borrar y expulsar', 'shield'], ['matches', 'Combates', 'Combates en línea recientes', 'swords']];
+function admMore() {
+  const st = [maintOn() ? '<span class="chip r" style="margin:0 6px 0 0">MANTENIMIENTO</span>' : '', noticeNow() ? '<span class="chip y" style="margin:0">aviso activo</span>' : ''].join('');
+  return `<div class="card"><div class="list">${MAS.map(([t, l, d, i]) => `<a class="it" href="${admUrl(t)}"><span class="av b">${ic(i)}</span><span class="tx"><b>${l}</b><small>${t === 'game' && st ? st.replace(/margin-left:6px/g, '') : d}</small></span>${ic('chev')}</a>`).join('')}</div></div>`;
+}
+const DAYS = (sel, never) => `${never ? `<option value="0"${sel === 0 ? ' selected' : ''}>${never}</option>` : ''}${[1, 3, 7, 14, 30].map(d => `<option value="${d}"${sel === d ? ' selected' : ''}>${d} ${d == 1 ? 'día' : 'días'}</option>`).join('')}`;
+function admGame() {
+  const M = SET.maint || {}, N = noticeNow(), back = admUrl('game');
+  return `<form class="card" method="post" action="/admin">${hidF('maint_set', back)}<h2>${ic('wrench')}Modo mantenimiento${M.on ? '<small><span class="chip r">ACTIVADO</span></small>' : ''}</h2>
+${M.on ? `<div class="state r">${ic('wrench')}<span class="tx"><b>Nadie puede buscar partida en línea</b><small>${escH(M.msg || 'Sin mensaje')}</small></span></div>` : ''}
+<label>Mensaje que verán al darle a jugar en línea</label><input name="msg" maxlength="120" value="${escH(M.msg || '')}" placeholder="Estamos mejorando el juego. Vuelve en un rato.">
+${M.on ? `<input type="hidden" name="on" value="0"><button class="btn">${ic('wrench')}Desactivar mantenimiento</button>` : `<input type="hidden" name="on" value="1"><button class="btn red" onclick="return confirm('¿Activar el mantenimiento? Nadie podrá jugar en línea hasta que lo quites.')">${ic('wrench')}Activar mantenimiento</button>`}
+<p class="hint">Solo bloquea el modo en línea: contra bots se sigue jugando. Los combates que ya estén en marcha terminan normal. Con el juego v3.0.6 o más nuevo también sale un aviso al abrir.</p></form>
+<form class="card" method="post" action="/admin">${hidF('notice_set', back)}<h2>${ic('megaphone')}Aviso al abrir el juego${N ? '<small><span class="chip g">activo</span></small>' : ''}</h2>
+${N ? `<div class="state">${ic('megaphone')}<span class="tx"><b>${escH(N.title || 'Aviso')}</b><small>${escH(N.text)} · ${N.until ? 'hasta ' + whenES(N.until) : 'sin fecha de fin'}</small></span></div>` : ''}
+<label>Título</label><input name="title" maxlength="40" placeholder="¡Novedades!">
+<label>Texto</label><textarea name="text" maxlength="300" rows="3" placeholder="Hay nuevas bolas en la tienda…"></textarea>
+<label>Activo durante</label><select name="days">${DAYS(3, 'Sin fecha de fin')}</select>
+<button class="btn gold">${ic('megaphone')}${N ? 'Cambiar el aviso' : 'Publicar aviso'}</button>
+<p class="hint">Le sale una sola vez a cada jugador, cuando abre el juego y no está en un combate. Si lo cambias, vuelve a salir a todos.</p></form>
+${N ? `<form class="card" method="post" action="/admin" style="padding:12px 16px">${hidF('notice_clear', back)}<button class="btn" style="margin:0">Quitar el aviso</button></form>` : ''}`;
+}
+async function admPromos() {
+  const rows = await q(`select code, coins, gems, max_uses, uses, msg, active, ${msOf('until')} as until_ms, ${msOf('created')} as ts from promos order by created desc limit 50`);
+  return `<form class="card" method="post" action="/admin">${hidF('promo_new', admUrl('promos'))}<h2>${ic('ticket')}Crear código</h2>
+<label>Código (letras y números, sin espacios)</label><input name="code" required maxlength="24" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="NAVIDAD25" style="text-transform:uppercase">
+<div class="two"><div><label>Monedas</label><input name="coins" type="number" min="0" max="100000" inputmode="numeric" placeholder="0"></div><div><label>Gemas</label><input name="gems" type="number" min="0" max="10000" inputmode="numeric" placeholder="0"></div></div>
+<div class="two"><div><label>Usos máximos (0 = sin límite)</label><input name="max" type="number" min="0" max="1000000" inputmode="numeric" placeholder="0"></div><div><label>Caduca en</label><select name="days">${DAYS(0, 'Nunca')}</select></div></div>
+<label>Mensaje (lo verá al canjearlo)</label><input name="msg" maxlength="100" placeholder="¡Feliz Navidad!">
+<button class="btn gold">${ic('ticket')}Crear código</button><p class="hint">Cada cuenta y cada móvil puede canjear un código una sola vez. Se canjea en el juego en Ajustes → Canjear código (v3.0.6 o más nuevo).</p></form>
+<div class="card"><h2>${ic('ticket')}Códigos<small>${rows.length}</small></h2><div class="list">${rows.map(r => { const late = r.until_ms && Number(r.until_ms) < Date.now(), full = r.max_uses > 0 && r.uses >= r.max_uses, on = r.active && !late && !full;
+  return `<div class="it"><span class="av${on ? '' : ' g'}">${ic('ticket')}</span><span class="tx"><b>${escH(r.code)}${on ? '<span class="chip g">activo</span>' : !r.active ? '<span class="chip">pausado</span>' : late ? '<span class="chip r">caducado</span>' : '<span class="chip y">agotado</span>'}</b><small>${[r.coins ? fmtN(r.coins) + ' monedas' : '', r.gems ? fmtN(r.gems) + ' gemas' : ''].filter(Boolean).join(' · ') || 'nada'} · ${fmtN(r.uses)}${r.max_uses ? ' / ' + fmtN(r.max_uses) : ''} usos${r.until_ms ? ' · ' + (late ? 'caducó ' : 'hasta ') + whenES(r.until_ms) : ''}${r.msg ? ' · ' + escH(r.msg) : ''}</small></span><form method="post" action="/admin">${hidF('promo_toggle', admUrl('promos'), { code: r.code })}<button class="btn sm">${r.active ? 'Pausar' : 'Activar'}</button></form></div>`; }).join('') || '<p class="none">Ninguno todavía.</p>'}</div></div>`;
+}
+async function admClubs(qs) {
+  const s = String(qs || '').trim().toLowerCase().replace(/[%_]/g, '').slice(0, 20);
+  const rows = await q(`select c.id, c.name, c.descr, ${msOf('c.created')} as ts, po.name as owner_name, count(m.acct)::int as n, coalesce(sum(p.trophies), 0)::int as tr
+    from clubs c left join club_members m on m.club = c.id left join players p on p.id = m.acct left join players po on po.id = c.owner
+    where ($1 = '' or c.name_lc like '%' || $1 || '%') group by c.id, po.name order by tr desc, c.id limit 100`, [s]);
+  return `<form class="srch" method="get" action="/admin"><input type="hidden" name="t" value="clubs"><input name="q" value="${escH(qs || '')}" placeholder="Nombre del club" autocomplete="off" spellcheck="false" enterkeyhint="search"><button class="btn gold">Buscar</button></form>
+<div class="card"><h2>${ic('shield')}${s ? 'Resultados' : 'Clubs'}<small>${rows.length}${rows.length >= 100 ? '+' : ''}</small></h2><div class="list">${rows.map(r => `<a class="it" href="${admUrl('club', { id: r.id })}"><span class="av b">${ini(r.name)}</span><span class="tx"><b>${escH(r.name)}</b><small>${r.n} ${r.n == 1 ? 'miembro' : 'miembros'} · ${fmtN(r.tr)} trofeos · líder ${escH(r.owner_name || '?')}</small></span>${ic('chev')}</a>`).join('') || `<p class="none">${s ? 'Ningún club con ese nombre.' : 'Aún no hay clubs.'}</p>`}</div></div>`;
+}
+async function admClub(id) {
+  const c = (await q(`select id, name, descr, owner, ${msOf('created')} as ts from clubs where id = $1`, [id]))[0];
+  if (!c) return `<div class="card"><p class="none">Ese club ya no existe.</p></div>`;
+  const mem = await q(`select p.id, p.name, p.trophies, a.username, m.role from club_members m join players p on p.id = m.acct left join accounts a on a.id = p.id order by (m.role = 'owner') desc, p.trophies desc`.replace('order by', 'where m.club = $1 order by'), [id]);
+  const msgs = await q(`select id, name, text, ${msOf('created')} as ts from club_msgs where club = $1 order by id desc limit 20`, [id]);
+  const back = admUrl('club', { id });
+  return `<div class="card"><div class="hero"><span class="av b">${ini(c.name)}</span><div class="tx"><h2>${escH(c.name)}</h2><small>${escH(c.descr || 'Sin descripción')} · creado ${whenES(c.ts)}</small></div></div></div>
+<form class="card" method="post" action="/admin">${hidF('club_rename', back, { id })}<h2>${ic('shield')}Cambiar nombre</h2><label>Nombre nuevo</label><input name="name" maxlength="20" required autocomplete="off" spellcheck="false" placeholder="${escH(c.name)}"><button class="btn gold">Cambiar nombre</button></form>
+<div class="card"><h2>${ic('users')}Miembros<small>${mem.length}</small></h2><div class="list">${mem.map(x => `<div class="it"><a class="av${x.role === 'owner' ? '' : ' g'}" href="${plLink('', x.username || '')}" style="text-decoration:none">${ini(x.name)}</a><span class="tx"><b>${escH(x.name)}${x.role === 'owner' ? '<span class="chip y">líder</span>' : ''}</b><small>${x.username ? escH(x.username) + ' · ' : ''}${fmtN(x.trophies)} trofeos</small></span><form method="post" action="/admin">${hidF('club_kick', back, { id, acct: x.id })}<button class="btn sm" onclick="return confirm('¿Expulsar a ${escH(x.name).replace(/'/g, '')} del club?')">Expulsar</button></form></div>`).join('') || '<p class="none">Sin miembros.</p>'}</div></div>
+<div class="card"><h2>${ic('chat')}Chat<small>últimos ${msgs.length}</small></h2><div class="list">${msgs.map(x => `<div class="it"><span class="tx"><b>${escH(x.name)}</b><small style="color:var(--txt)">${escH(x.text)}</small><small>${agoES(x.ts)}</small></span><form method="post" action="/admin">${hidF('club_msgdel', back, { id, msg: x.id })}<button class="btn sm">Borrar</button></form></div>`).join('') || '<p class="none">Sin mensajes.</p>'}</div></div>
+<form class="card" method="post" action="/admin">${hidF('club_del', admUrl('clubs'), { id })}<h2>${ic('ban')}Borrar club</h2><p class="hint" style="margin-top:0">Se borra el club y su chat; los miembros se quedan sin club.</p><button class="btn red" onclick="return confirm('¿Borrar el club ${escH(c.name).replace(/'/g, '')} para siempre?')">Borrar club</button></form>`;
+}
+const CARDN = { vida: 'Vida', dano: 'Daño', velocidad: 'Velocidad', giro: 'Giro', peso: 'Peso', alcance: 'Alcance', vampiro: 'Vampiro', critico: 'Crítico', regen: 'Regeneración', furia: 'Furia', coraza: 'Coraza' };
+const cardES = c => { const [id, lv] = String(c).split(' '); return (CARDN[id] || id) + (lv ? ' nv ' + lv : ''); };
+const RSN = { fin: '', quit: 'se rindió', stall: 'se colgó', 'desconexión': 'desconexión', timeout: 'tiempo agotado' };
+async function admMatches(qs) {
+  const s = String(qs || '').trim().toLowerCase().replace(/[%_]/g, '').slice(0, 24);
+  const rows = await q(`select kind, winner, reason, dur, a_name, a_dev, a_user, a_tr, a_card, b_name, b_dev, b_user, b_tr, b_card, ${msOf('created')} as ts from matches
+    where ($1 = '' or lower(a_name) like '%' || $1 || '%' or lower(b_name) like '%' || $1 || '%' or lower(a_dev) = $1 or lower(b_dev) = $1 or lower(a_user) = $1 or lower(b_user) = $1)
+    order by created desc limit 80`, [s]);
+  const tot = (await q(`select count(*)::int as n, count(*) filter (where created > now() - interval '24 hours')::int as d1 from matches`))[0];
+  const side = (r, k) => { const w = r.winner === k, nm = r[k.toLowerCase() + '_name'] || 'Jugador', u = r[k.toLowerCase() + '_user'], d = r[k.toLowerCase() + '_dev'], cd = r[k.toLowerCase() + '_card'];
+    return `<a href="${plLink(d || '', u || '')}" class="mside${w ? ' w' : ''}"><b>${w ? '🏆 ' : ''}${escH(nm)}</b><small>${fmtN(r[k.toLowerCase() + '_tr'])} trofeos${cd ? ' · ' + escH(cardES(cd)) : ''}</small></a>`; };
+  return `<form class="srch" method="get" action="/admin"><input type="hidden" name="t" value="matches"><input name="q" value="${escH(qs || '')}" placeholder="Apodo, cuenta o ID" autocapitalize="off" autocomplete="off" spellcheck="false" enterkeyhint="search"><button class="btn gold">Buscar</button></form>
+<div class="card"><h2>${ic('swords')}${s ? 'Combates de ' + escH(qs) : 'Últimos combates'}<small>${fmtN(tot.d1)} hoy · ${fmtN(tot.n)} en 30 días</small></h2><div class="list">${rows.map(r => `<div class="mrow"><div class="mhead"><span class="chip${r.kind === 'normal' ? ' g' : ''}" style="margin:0">${r.kind === 'normal' ? 'Amistoso' : 'Competitivo'}</span><small>${agoES(r.ts)} · ${r.dur >= 60 ? (r.dur / 60 | 0) + ' min ' : ''}${r.dur % 60} s${RSN[r.reason] ? ' · ' + RSN[r.reason] : r.reason && RSN[r.reason] == null ? ' · ' + escH(r.reason) : ''}${!r.winner ? ' · sin ganador' : ''}</small></div><div class="mvs">${side(r, 'A')}<span class="vs">VS</span>${side(r, 'B')}</div></div>`).join('') || `<p class="none">${s ? 'Ningún combate de ese jugador.' : 'Aún no hay combates apuntados (se apuntan desde el servidor v298).'}</p>`}</div>${rows.length >= 80 ? '<p class="hint">Salen los 80 más recientes. Se guardan 30 días.</p>' : ''}</div>`;
+}
+
 /* ---------- acciones (POST) ---------- */
 async function admGiftTo(acct, dev, coins, gems, tr, gmsg) {
   await q('insert into gifts (target_acct, target_dev, coins, gems, trophies, msg) values ($1, $2, $3, $4, $5, $6)', [acct, acct ? '' : dev, coins, gems, tr, gmsg]);
@@ -645,6 +751,41 @@ async function admAction(f) {
     return [`Regalo para todos enviado: ${fmtN(coins)} monedas y ${fmtN(gems)} gemas durante ${days} ${days == 1 ? 'día' : 'días'}.`];
   }
   if (a === 'giftall_end') { await q('update gift_all set until = now() where id = $1 and until > now()', [Number(f.get('id')) || 0]); await gAllLoad(); return ['Regalo para todos terminado.']; }
+  if (a === 'maint_set') { const on = f.get('on') === '1', msg = txt('msg', 120); await setSet('maint', { on, msg }); console.log('MANTENIMIENTO', on ? 'activado' : 'desactivado');
+    return [on ? 'Mantenimiento activado: nadie puede buscar partida en línea.' : 'Mantenimiento desactivado.']; }
+  if (a === 'notice_set') { const title = txt('title', 40), text = txt('text', 300), days = Math.max(0, Math.min(30, Number(f.get('days')) || 0));
+    if (!text) return ['Escribe el texto del aviso.', 1];
+    await setSet('notice', { id: Date.now(), title, text, until: days ? Date.now() + days * 864e5 : 0 }); return ['Aviso publicado. Saldrá al abrir el juego.']; }
+  if (a === 'notice_clear') { await setSet('notice', null); return ['Aviso quitado.']; }
+  if (a === 'promo_new') {
+    const code = String(f.get('code') || '').toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24), coins = num('coins', 0, 1e5), gems = num('gems', 0, 1e4), max = num('max', 0, 1e6), days = num('days', 0, 365), msg = txt('msg', 100);
+    if (code.length < 3) return ['El código necesita al menos 3 letras o números.', 1];
+    if (!coins && !gems) return ['Pon alguna moneda o gema.', 1];
+    const r = await q(`insert into promos (code, coins, gems, max_uses, until, msg) values ($1, $2, $3, $4, case when $5::int > 0 then now() + ($5 || ' days')::interval end, $6) on conflict (code) do nothing returning code`, [code, coins, gems, max, days, msg]);
+    if (!r.length) return [`El código ${code} ya existe.`, 1];
+    console.log(`CÓDIGO creado · ${code} · ${coins} monedas, ${gems} gemas`); return [`Código ${code} creado.`];
+  }
+  if (a === 'promo_toggle') { const r = await q('update promos set active = not active where code = $1 returning active', [String(f.get('code') || '')]); return r.length ? [r[0].active ? 'Código activado.' : 'Código pausado.'] : ['Ese código no existe.', 1]; }
+  if (a.startsWith('club_')) {
+    const id = Number(f.get('id')) || 0, c = (await q('select id, name, owner from clubs where id = $1', [id]))[0]; if (!c) return ['Ese club ya no existe.', 1];
+    if (a === 'club_rename') {
+      const name = cleanTxt(f.get('name'), 20); if (name.length < 3) return ['El nombre necesita al menos 3 letras.', 1]; if (mfBadName(name)) return ['Ese nombre no está permitido.', 1];
+      try { await q('update clubs set name = $2, name_lc = $3 where id = $1', [id, name, name.toLowerCase()]); } catch (e) { if (/unique|duplicate/i.test(e.message)) return ['Ya hay otro club con ese nombre.', 1]; throw e; }
+      await clubTell(id); console.log(`CLUB renombrado · ${c.name} → ${name}`); return [`Club renombrado a ${name}.`];
+    }
+    if (a === 'club_del') { const mem = await q('select acct from club_members where club = $1', [id]); await q('delete from clubs where id = $1', [id]);
+      for (const r of mem) tell(r.acct, { t: 'cl_ev' }); console.log(`CLUB borrado · ${c.name}`); return [`Club ${c.name} borrado.`]; }
+    if (a === 'club_kick') {
+      const acct = String(f.get('acct') || ''), mm = (await q('select role from club_members where acct = $1 and club = $2', [acct, id]))[0]; if (!mm) return ['Ya no está en el club.', 1];
+      await q('delete from club_members where acct = $1', [acct]);
+      if (mm.role === 'owner') { const next = (await q('select acct from club_members where club = $1 order by joined limit 1', [id]))[0];
+        if (next) { await q(`update club_members set role = 'owner' where acct = $1`, [next.acct]); await q('update clubs set owner = $2 where id = $1', [id, next.acct]); }
+        else { await q('delete from clubs where id = $1', [id]); tell(acct, { t: 'cl_ev' }); return ['Expulsado. El club se ha quedado vacío y se ha borrado.']; } }
+      tell(acct, { t: 'cl_ev' }); await clubTell(id); return ['Expulsado del club.'];
+    }
+    if (a === 'club_msgdel') { const mid = Number(f.get('msg')) || 0; await q('delete from club_msgs where id = $1 and club = $2', [mid, id]);
+      for (const r of await q('select acct from club_members where club = $1', [id])) tell(r.acct, { t: 'cl_msgdel', id: mid }); return ['Mensaje borrado.']; }
+  }
   return ['Acción desconocida.', 1];
 }
 
@@ -679,7 +820,7 @@ function adminHttp(req, res) {
   if (!sess) return login('');
   (async () => {
     const u = new URL(req.url, 'http://x'), p = u.searchParams, t = p.get('t') || 'home', m = p.get('m') || '', err = p.get('e') === '1';
-    const badges = { bans: [...bans.values()].filter(banLive).length || 0 };
+    const badges = { bans: [...bans.values()].filter(banLive).length || 0, more: maintOn() ? '!' : 0 };
     try { if (dbReady) badges.reports = (await q(`select count(*)::int as n from reports where created > now() - interval '24 hours'`))[0].n || 0; } catch (e) {}
     if (!dbReady && t !== 'bans') return html(200, admShell(t, 'Panel', `<div class="card"><p class="none">La base de datos todavía no está lista. Solo funciona el apartado Baneos.</p></div>`, { badges, m, err }));
     try {
@@ -689,6 +830,13 @@ function adminHttp(req, res) {
       if (t === 'bans') return html(200, admShell(t, 'Baneos', await admBans(p.get('pre')), { badges, m, err }));
       if (t === 'gifts') return html(200, admShell(t, 'Regalos', await admGifts(), { badges, m, err }));
       if (t === 'reports') return html(200, admShell(t, 'Denuncias', await admReports(), { badges, m, err }));
+      if (t === 'more') return html(200, admShell('more', 'Más', admMore(), { badges, m, err }));
+      const sub = { badges, m, err, back: admUrl('more') };
+      if (t === 'game') return html(200, admShell('more', 'Juego', admGame(), sub));
+      if (t === 'promos') return html(200, admShell('more', 'Códigos', await admPromos(), sub));
+      if (t === 'clubs') return html(200, admShell('more', 'Clubs', await admClubs(p.get('q')), sub));
+      if (t === 'club') return html(200, admShell('more', 'Club', await admClub(Number(p.get('id')) || 0), Object.assign({}, sub, { back: admUrl('clubs') })));
+      if (t === 'matches') return html(200, admShell('more', 'Combates', await admMatches(p.get('q')), sub));
       return html(200, admShell('home', 'Panel · Marble Fights', await admHome(), { badges, m, err }));
     } catch (e) { console.error('panel', t, e.message); html(200, admShell(t, 'Error', `<div class="card"><p class="none">Error: ${escH(e.message)}</p></div>`, { badges })); }
   })();
@@ -705,7 +853,8 @@ const server = http.createServer((req, res) => {
     if (id) console.log(`abrir · id=${id} · apodo=${n || '?'}${u ? ' · cuenta=' + u : ''} · versión=${v || '?'} · baneado=${b ? 'SÍ' : 'no'}`);
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*', 'cache-control': 'no-store' });
     const gift = !!id && (giftPend.has('D:' + id) || (devAcct.has(id) && giftPend.has('A:' + devAcct.get(id))) || gAllPending(id, devAcct.get(id) || ''));
-    res.end(JSON.stringify(Object.assign({ banned: b }, b ? banOut(B) : {}, gift ? { gift: true } : {}))); return;
+    const N = noticeNow();
+    res.end(JSON.stringify(Object.assign({ banned: b }, b ? banOut(B) : {}, gift ? { gift: true } : {}, maintOn() ? { maint: SET.maint.msg || '' } : {}, N ? { notice: { id: N.id, title: N.title || '', text: N.text } } : {}))); return;
   }
   if (req.url && req.url.startsWith('/top')) {
     try { const q = new URL(req.url, 'http://x').searchParams; if (q.get('n') && !(dbReady && nameOwner.has(String(q.get('n')).trim().toLowerCase()))) record(cleanLoadout({ name: q.get('n'), trophies: q.get('t'), id: q.get('b') })); } catch (e) {}
@@ -757,7 +906,7 @@ function tryMatch() {
 
 function createRoom(a, b, kind) {
   const [host, guest] = Math.random() < .5 ? [a, b] : [b, a];
-  const room = { id: nextRoom++, host, guest, seed: (Math.random() * 4294967295) >>> 0,
+  const room = { id: nextRoom++, host, guest, kind: kind || 'comp', seed: (Math.random() * 4294967295) >>> 0,
     arena: ARENAS[Math.floor(Math.random() * ARENAS.length)], t0: Date.now(), closed: false };
   host.room = guest.room = room; matchesPlayed++;
   room.cardT = setTimeout(() => roomCards(room), 26000);   // ruleta + 10 s para elegir + margen: si alguien no elige, se empieza igual
@@ -771,10 +920,19 @@ function roomCards(room) {
   const c = room.cards || {}, msg = { t: 'cards', A: c.A || null, B: c.B || null };
   send(room.host, msg); send(room.guest, msg);
 }
+function roomLog(room, winner, reason) {   // v298 · cada combate en línea queda apuntado para el panel
+  if (!dbReady || !room || room.logged) return; room.logged = true;
+  const P = w => { const l = w.loadout || {}; return [String(l.name || '').slice(0, 20), w.dev || '', w.u || '', Number(l.trophies) || 0]; };
+  const c = room.cards || {}, cd = x => x && x.id ? x.id + ' ' + x.lv : '';
+  q(`insert into matches (kind, winner, reason, dur, a_name, a_dev, a_user, a_tr, a_card, b_name, b_dev, b_user, b_tr, b_card) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+    [room.kind, winner, reason || '', Math.round((Date.now() - room.t0) / 1000), ...P(room.host), cd(c.A), ...P(room.guest), cd(c.B)]).catch(e => console.error('combates', e.message));
+  q(`delete from matches where created < now() - interval '30 days'`).catch(() => {});
+}
 function closeRoom(room, msgHost, msgGuest) {
   if (room) clearTimeout(room.cardT);
   if (!room || room.closed) return;
   room.closed = true;
+  { const m = msgGuest || msgHost; if (m) roomLog(room, m.winner || null, m.reason || 'fin'); }
   if (room.host.room === room) room.host.room = null;
   if (room.guest.room === room) room.guest.room = null;
   if (msgHost) send(room.host, msgHost);
@@ -1011,7 +1169,8 @@ function handle(ws, m) {
     case 'find': {
       if (room) return;
       const dev = str(m.dev, 16).toUpperCase().replace(/[^A-Z0-9-]/g, ''), ver = str(m.v, 12);
-      ws.dev = dev; ws.loadout = cleanLoadout(m.loadout);
+      ws.dev = dev; ws.u = str(m.u, 20); ws.loadout = cleanLoadout(m.loadout);
+      if (maintOn()) { send(ws, { t: 'maint', msg: SET.maint.msg || '' }); return; }
       if (dbReady && !nameMine(ws.loadout.name.toLowerCase(), dev)) ws.loadout.name = 'Jugador';   // apodo de otro jugador: no se puede usar
       console.log(`buscar · id=${dev || '?'} · apodo=${ws.loadout.name} · trofeos=${ws.loadout.trophies} · versión=${ver || '?'}`);
       if (MIN_VERSION && verNum(ver) < MIN_VERSION) { send(ws, { t: 'old' }); return; }
@@ -1079,7 +1238,7 @@ wss.on('connection', ws => {
     clients.delete(ws); leaveQueue(ws);
     if (ws.pid) { const s = online.get(ws.pid); if (s) { s.delete(ws); if (!s.size) { online.delete(ws.pid); friendsTell(ws.pid); } } }
     const room = ws.room;
-    if (room && !room.closed) { const other = ws === room.host ? room.guest : room.host; closeRoom(room, null, null); send(other, { t: 'left' }); }
+    if (room && !room.closed) { const other = ws === room.host ? room.guest : room.host; roomLog(room, ws === room.host ? 'B' : 'A', 'desconexión'); closeRoom(room, null, null); send(other, { t: 'left' }); }
   });
 });
 
