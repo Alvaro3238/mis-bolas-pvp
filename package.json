@@ -1,6 +1,6 @@
 {
   "name": "mis-bolas-pvp",
-  "version": "1.2.0",
+  "version": "1.9.0",
   "description": "Servidor en línea de Marble Fights (PVP y cuentas con guardado en la nube)",
   "main": "server.js",
   "scripts": {
